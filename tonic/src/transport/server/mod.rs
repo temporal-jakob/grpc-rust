@@ -77,6 +77,7 @@ use http_body_util::BodyExt;
 use hyper::{body::Incoming, service::Service as HyperService};
 use pin_project::pin_project;
 use std::{
+    any::Any,
     fmt,
     future::{self, Future},
     marker::PhantomData,
@@ -86,7 +87,10 @@ use std::{
     task::{Context, Poll, ready},
     time::Duration,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
 use tokio_stream::Stream;
 use tower::{
     Service, ServiceBuilder, ServiceExt,
@@ -415,7 +419,7 @@ impl<L> Server<L> {
     /// specified will be the time to remain idle before sending TCP keepalive
     /// probes.
     ///
-    /// Important: This setting is ignored when using `serve_with_incoming`.
+    /// With `serve_with_incoming`, this applies to connections yielded as a [`TcpStream`].
     ///
     /// Default is no keepalive (`None`)
     ///
@@ -432,7 +436,7 @@ impl<L> Server<L> {
     /// This option specifies the time interval between subsequent keepalive probes.
     /// This setting only takes effect if [`tcp_keepalive`](Self::tcp_keepalive) is also set.
     ///
-    /// Important: This setting is ignored when using `serve_with_incoming`.
+    /// With `serve_with_incoming`, this applies to connections yielded as a [`TcpStream`].
     ///
     /// Default is `None` (system default).
     ///
@@ -451,7 +455,7 @@ impl<L> Server<L> {
     /// before dropping the connection.
     /// This setting only takes effect if [`tcp_keepalive`](Self::tcp_keepalive) is also set.
     ///
-    /// Important: This setting is ignored when using `serve_with_incoming`.
+    /// With `serve_with_incoming`, this applies to connections yielded as a [`TcpStream`].
     ///
     /// Default is `None` (system default).
     ///
@@ -466,7 +470,7 @@ impl<L> Server<L> {
 
     /// Set the value of `TCP_NODELAY` option for accepted connections. Enabled by default.
     ///
-    /// Important: This setting is ignored when using `serve_with_incoming`.
+    /// With `serve_with_incoming`, this applies to connections yielded as a [`TcpStream`].
     #[must_use]
     pub fn tcp_nodelay(self, enabled: bool) -> Self {
         Server {
@@ -674,13 +678,9 @@ impl<L> Server<L> {
         }
     }
 
+    // The TCP options are applied to accepted connections by `serve_internal`.
     fn bind_incoming(&self, addr: SocketAddr) -> Result<TcpIncoming, super::Error> {
-        Ok(TcpIncoming::bind(addr)
-            .map_err(super::Error::from_source)?
-            .with_nodelay(Some(self.tcp_nodelay))
-            .with_keepalive(self.tcp_keepalive)
-            .with_keepalive_interval(self.tcp_keepalive_interval)
-            .with_keepalive_retries(self.tcp_keepalive_retries))
+        TcpIncoming::bind(addr).map_err(super::Error::from_source)
     }
 
     /// Serve the service.
@@ -722,7 +722,9 @@ impl<L> Server<L> {
 
     /// Serve the service on the provided incoming stream.
     ///
-    /// The `tcp_nodelay` and `tcp_keepalive` settings are ignored when using this method.
+    /// The TCP settings (`tcp_nodelay`, `tcp_keepalive`, ...) are applied to connections that
+    /// `incoming` yields as a [`TcpStream`], overriding options set by the stream (e.g. a
+    /// [`TcpIncoming`]). Other IO types are left as they are.
     pub async fn serve_with_incoming<S, I, IO, IE, ResBody>(
         self,
         svc: S,
@@ -808,8 +810,25 @@ impl<L> Server<L> {
         let http2_max_local_error_reset_streams = self.http2_max_local_error_reset_streams;
         let max_connection_age = self.max_connection_age;
         let max_connection_age_grace = self.max_connection_age_grace;
+        let tcp_nodelay = self.tcp_nodelay;
+        let tcp_keepalive = incoming::make_keepalive(
+            self.tcp_keepalive,
+            self.tcp_keepalive_interval,
+            self.tcp_keepalive_retries,
+        );
 
         let svc = self.service_builder.service(svc);
+
+        // Apply the TCP options to every accepted TCP connection, including ones
+        // from a caller-provided stream, before any TLS handshake.
+        let incoming = incoming.map(move |io| {
+            if let Ok(io) = &io
+                && let Some(stream) = (io as &dyn Any).downcast_ref::<TcpStream>()
+            {
+                incoming::set_accepted_socket_options(stream, Some(tcp_nodelay), &tcp_keepalive);
+            }
+            io
+        });
 
         let incoming = io_stream::ServerIoStream::new(
             incoming,
@@ -1096,7 +1115,8 @@ impl<L> Router<L> {
     /// Consume this [`Server`] creating a future that will execute the server
     /// on the provided incoming stream of `AsyncRead + AsyncWrite`.
     ///
-    /// This method discards any provided [`Server`] TCP configuration.
+    /// The [`Server`] TCP configuration is applied to connections that `incoming` yields as a
+    /// [`TcpStream`]. Other IO types are left as they are.
     ///
     /// [`Server`]: struct.Server.html
     pub async fn serve_with_incoming<I, IO, IE, ResBody>(
@@ -1128,7 +1148,8 @@ impl<L> Router<L> {
     /// When `signal` completes, `incoming` is dropped immediately (closing a
     /// TCP listener) and already-accepted connections are then drained.
     ///
-    /// This method discards any provided [`Server`] TCP configuration.
+    /// The [`Server`] TCP configuration is applied to connections that `incoming` yields as a
+    /// [`TcpStream`]. Other IO types are left as they are.
     ///
     /// [`Server`]: struct.Server.html
     pub async fn serve_with_incoming_shutdown<I, IO, IE, F, ResBody>(

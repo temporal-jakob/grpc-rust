@@ -38,6 +38,9 @@ use tracing::warn;
 ///
 /// An incoming stream, usable with [Router::serve_with_incoming](super::Router::serve_with_incoming),
 /// of `AsyncRead + AsyncWrite` that communicate with clients that connect to a socket address.
+///
+/// When served by a [`Server`](super::Server), the server's `TCP_NODELAY` setting, and its
+/// keepalive settings if set, take precedence over the ones configured here.
 #[derive(Debug)]
 pub struct TcpIncoming {
     inner: TcpListenerStream,
@@ -165,7 +168,7 @@ impl Stream for TcpIncoming {
 }
 
 // Consistent with hyper-0.14, this function does not return an error.
-fn set_accepted_socket_options(
+pub(super) fn set_accepted_socket_options(
     stream: &TcpStream,
     nodelay: Option<bool>,
     keepalive: &Option<TcpKeepalive>,
@@ -184,7 +187,7 @@ fn set_accepted_socket_options(
     }
 }
 
-fn make_keepalive(
+pub(super) fn make_keepalive(
     keepalive_time: Option<Duration>,
     keepalive_interval: Option<Duration>,
     keepalive_retries: Option<u32>,
